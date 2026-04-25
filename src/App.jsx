@@ -9,8 +9,8 @@ import {
   renameImageFiles,
   convertCsvToJson,
   mergeJsonData,
-  createZip,
 } from './lib/fileUtils';
+import { uploadFilesToR2 } from './lib/r2Upload';
 
 function App() {
   // state for user-uploaded files
@@ -21,84 +21,77 @@ function App() {
   // state for user input and ui control
   const [prefix, setPrefix] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState({}); // tracks per-file upload progress
   const [results, setResults] = useState(null);
   const [isResultsModalOpen, setIsResultsModalOpen] = useState(false);
 
   // handler to sort files from the consolidated uploader
   const handleFileSelection = (selectedFiles) => {
-    // find the first file ending with .csv in the selection
     const csv = selectedFiles.find(file => file.name.toLowerCase().endsWith('.csv'));
-    // filter for all files ending with .jpg or .jpeg
-    const images = selectedFiles.filter(file => 
+    const images = selectedFiles.filter(file =>
       file.name.toLowerCase().endsWith('.jpg') || file.name.toLowerCase().endsWith('.jpeg')
     );
+    if (csv) setCsvFile(csv);
+    if (images.length > 0) setImageFiles(images);
+  };
 
-    if (csv) {
-      setCsvFile(csv);
-    }
-    
-    if (images.length > 0) {
-      setImageFiles(images);
-    }
+  // callback to update per-file upload status for the progress display
+  const handleUploadProgress = (fileName, status) => {
+    setUploadStatus(prev => ({ ...prev, [fileName]: status }));
   };
 
   // main handler for processing all the files
   const handleProcessFiles = async () => {
-    // validate that all required files and inputs are present
     if (!imageFiles.length || !csvFile || !jsonFile || !prefix) {
-      alert('please upload all files and provide a prefix.');
+      alert('Please upload all files and provide a prefix.');
       return;
     }
 
     setIsLoading(true);
     setResults(null);
+    setUploadStatus({});
 
     try {
-      // ensure the prefix always ends with an underscore for processing
       const processingPrefix = prefix.endsWith('_') ? prefix : `${prefix}_`;
-      // create a clean name for the zip file without the trailing underscore
-      const zipName = `${prefix.replace(/_$/, '')}.zip`;
 
-      // read the user-uploaded json file as text
+      // step 1: read the existing master JSON
       const existingJsonText = await jsonFile.text();
       const existingJson = JSON.parse(existingJsonText);
 
-      // rename image files based on the prefix
+      // step 2: rename image files based on the prefix
       const renamedImages = await renameImageFiles(imageFiles, processingPrefix);
       if (renamedImages.length === 0) {
-        throw new Error("no images matched the expected naming format '###-pano.jpg'.");
+        throw new Error("No images matched the expected naming format '###-pano.jpg'.");
       }
 
-      // convert the csv data to a json object
-      const newJsonData = await convertCsvToJson(csvFile, processingPrefix);
-      // merge the new data into the existing json data
+      // step 3: upload renamed images directly to Cloudflare R2
+      // urlMap is a Map of { filename -> full public URL }
+      const urlMap = await uploadFilesToR2(renamedImages, handleUploadProgress);
+
+      // step 4: convert CSV to JSON, embedding the R2 URLs
+      const newJsonData = await convertCsvToJson(csvFile, processingPrefix, urlMap);
+
+      // step 5: merge into the master JSON
       const finalJson = mergeJsonData(existingJson, newJsonData);
 
-      // create a zip archive of the renamed images
-      const zipBlob = await createZip(renamedImages, zipName);
-      
-      // create downloadable blob urls for the results
-      const zipUrl = URL.createObjectURL(zipBlob);
+      // step 6: make the updated JSON available for download
       const jsonBlob = new Blob([JSON.stringify(finalJson, null, 2)], { type: 'application/json' });
       const jsonUrl = URL.createObjectURL(jsonBlob);
-      
-      // set the results to be displayed in the modal
-      setResults({
-        zipUrl,
-        zipName,
-        jsonUrl,
-      });
 
-      // open the results modal
+      setResults({ jsonUrl });
       setIsResultsModalOpen(true);
 
     } catch (error) {
-      console.error("error processing files:", error);
-      alert(`an error occurred: ${error.message}`);
+      console.error('Error processing files:', error);
+      alert(`An error occurred: ${error.message}`);
     } finally {
       setIsLoading(false);
     }
   };
+
+  // count how many files have finished uploading
+  const uploadedCount = Object.values(uploadStatus).filter(s => s === 'done').length;
+  const totalCount = imageFiles.length;
 
   return (
     <>
@@ -108,27 +101,23 @@ function App() {
         title="Processing Complete"
       >
         <div className="flex flex-col gap-4">
-            <p className="text-sm text-gray-600">Your files have been processed successfully. You can download them below.</p>
-            <a 
-              href={results?.zipUrl} 
-              download={results?.zipName} 
-              className="w-full text-center px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-700 transition-colors"
-            >
-              Download Renamed Images (.zip)
-            </a>
-            <a 
-              href={results?.jsonUrl} 
-              download="pano_correction_data.json" 
-              className="w-full text-center px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-700 transition-colors"
-            >
-              Download Updated JSON
-            </a>
+          <p className="text-sm text-gray-600">
+            All {uploadedCount} images have been uploaded to Cloudflare R2.
+            Download your updated JSON file below.
+          </p>
+          <a
+            href={results?.jsonUrl}
+            download="pano_data.json"
+            className="w-full text-center px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-700 transition-colors"
+          >
+            Download Updated JSON
+          </a>
         </div>
       </Modal>
 
       <main className="flex flex-col items-center p-5 space-y-4 max-w-2xl mx-auto">
         <h1 className="text-3xl font-bold">Pano Sync Processor</h1>
-        
+
         <div className="w-full p-4 border rounded-lg bg-gray-50">
           <h2 className="text-xl font-light text-[#2D2D31] mb-2">1. Upload Files</h2>
           <div className="space-y-4">
@@ -157,9 +146,24 @@ function App() {
             </div>
           </div>
         </div>
-        
+
         <PrefixInput value={prefix} onChange={setPrefix} />
-        
+
+        {/* upload progress display — only shown during processing */}
+        {isLoading && totalCount > 0 && (
+          <div className="w-full p-4 border rounded-lg bg-gray-50">
+            <h2 className="text-xl font-light text-[#2D2D31] mb-2">
+              Uploading to R2... {uploadedCount}/{totalCount}
+            </h2>
+            <div className="w-full bg-gray-200 rounded-full h-2.5">
+              <div
+                className="bg-[#FD366E] h-2.5 rounded-full transition-all duration-300"
+                style={{ width: `${totalCount > 0 ? (uploadedCount / totalCount) * 100 : 0}%` }}
+              />
+            </div>
+          </div>
+        )}
+
         <ActionPanel onProcess={handleProcessFiles} isLoading={isLoading} />
       </main>
     </>
