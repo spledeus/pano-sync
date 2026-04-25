@@ -10,7 +10,7 @@ import {
   convertCsvToJson,
   mergeJsonData,
 } from './lib/fileUtils';
-import { uploadFilesToR2 } from './lib/r2Upload';
+import { uploadFilesToR2, uploadJsonToR2 } from './lib/r2Upload';
 
 function App() {
   // state for user-uploaded files
@@ -21,7 +21,7 @@ function App() {
   // state for user input and ui control
   const [prefix, setPrefix] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState({}); // tracks per-file upload progress
+  const [uploadStatus, setUploadStatus] = useState({});
   const [results, setResults] = useState(null);
   const [isResultsModalOpen, setIsResultsModalOpen] = useState(false);
 
@@ -54,6 +54,10 @@ function App() {
     try {
       const processingPrefix = prefix.endsWith('_') ? prefix : `${prefix}_`;
 
+      // The folder name is the prefix without the trailing underscore
+      // e.g. "PROJECT_20250819_" -> "PROJECT_20250819"
+      const folder = processingPrefix.replace(/_$/, '');
+
       // step 1: read the existing master JSON
       const existingJsonText = await jsonFile.text();
       const existingJson = JSON.parse(existingJsonText);
@@ -64,9 +68,8 @@ function App() {
         throw new Error("No images matched the expected naming format '###-pano.jpg'.");
       }
 
-      // step 3: upload renamed images directly to Cloudflare R2
-      // urlMap is a Map of { filename -> full public URL }
-      const urlMap = await uploadFilesToR2(renamedImages, handleUploadProgress);
+      // step 3: upload renamed images to Cloudflare R2 inside the folder
+      const urlMap = await uploadFilesToR2(renamedImages, folder, handleUploadProgress);
 
       // step 4: convert CSV to JSON, embedding the R2 URLs
       const newJsonData = await convertCsvToJson(csvFile, processingPrefix, urlMap);
@@ -74,11 +77,10 @@ function App() {
       // step 5: merge into the master JSON
       const finalJson = mergeJsonData(existingJson, newJsonData);
 
-      // step 6: make the updated JSON available for download
-      const jsonBlob = new Blob([JSON.stringify(finalJson, null, 2)], { type: 'application/json' });
-      const jsonUrl = URL.createObjectURL(jsonBlob);
+      // step 6: upload the merged JSON to R2 (overwrites pano_data.json)
+      const jsonPublicUrl = await uploadJsonToR2(finalJson);
 
-      setResults({ jsonUrl });
+      setResults({ jsonPublicUrl });
       setIsResultsModalOpen(true);
 
     } catch (error) {
@@ -103,15 +105,19 @@ function App() {
         <div className="flex flex-col gap-4">
           <p className="text-sm text-gray-600">
             All {uploadedCount} images have been uploaded to Cloudflare R2.
-            Download your updated JSON file below.
+            Your JSON file has been updated and is live at:
           </p>
           <a
-            href={results?.jsonUrl}
-            download="pano_data.json"
-            className="w-full text-center px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-700 transition-colors"
+            href={results?.jsonPublicUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="w-full text-center px-4 py-2 rounded-md bg-gray-600 text-white hover:bg-gray-700 transition-colors break-all"
           >
-            Download Updated JSON
+            {results?.jsonPublicUrl}
           </a>
+          <p className="text-xs text-gray-400">
+            Your GIS map can point permanently to this URL — it will always reflect the latest data.
+          </p>
         </div>
       </Modal>
 
