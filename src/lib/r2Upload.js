@@ -105,6 +105,24 @@ const uploadToR2 = async (objectKey, body, contentType) => {
 };
 
 /**
+ * Fetches the current pano_data.json directly from R2's public URL.
+ * Returns an empty object if the file doesn't exist yet.
+ * @returns {Promise<object>} - The parsed JSON object.
+ */
+export const fetchJsonFromR2 = async () => {
+  const url = `${PUBLIC_URL}/pano_data.json?nocache=${Date.now()}`;
+  const response = await fetch(url);
+  if (response.status === 404) {
+    console.warn('pano_data.json not found in R2 — starting fresh.');
+    return {};
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to fetch pano_data.json: ${response.status}`);
+  }
+  return response.json();
+};
+
+/**
  * Uploads a single image file to R2 inside a folder named after the prefix.
  * Example: prefix=PROJECT_20250819_ -> folder=PROJECT_20250819
  * @param {File} file - The renamed image file.
@@ -140,7 +158,7 @@ export const uploadFilesToR2 = async (files, folder, onProgress) => {
 
 /**
  * Uploads the final merged JSON to R2 at the root of the bucket.
- * The file is always named pano_data.json so the GIS map URL never changes.
+ * Always overwrites pano_data.json so the GIS map URL never changes.
  * @param {object} jsonData - The final merged JSON object.
  * @returns {Promise<string>} - The public URL of the JSON file.
  */
