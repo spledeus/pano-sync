@@ -6,6 +6,8 @@ A client-side web application for batch processing and renaming panoramic image 
 
 ## Overview
 
+This tool has been modified to work with CloudFlare.  It is a little different.
+
 This tool is designed to streamline the workflow for preparing panoramic image assets. It allows a user to upload a batch of JPG images, a semicolon-delimited CSV file with correction data, and an existing master JSON file. The application then renames the images based on a user-provided prefix, converts the CSV data into a JSON format, and merges it into the master JSON file. The final processed assets—a ZIP archive of the renamed images and the updated JSON file—are then made available for download.
 
 ## Features
