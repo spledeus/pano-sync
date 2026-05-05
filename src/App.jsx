@@ -1,6 +1,7 @@
 // src/App.jsx
 import { useState, useEffect } from 'react';
 import './App.css';
+import JSZip from 'jszip';
 import FileUploader from './components/FileUploader';
 import PrefixInput from './components/PrefixInput';
 import ActionPanel from './components/ActionPanel';
@@ -12,16 +13,42 @@ import {
 } from './lib/fileUtils';
 import { uploadFilesToR2, uploadJsonToR2, fetchJsonFromR2 } from './lib/r2Upload';
 
+/**
+ * Extracts JPG and CSV files from a ZIP, ignoring PNGs and anything else.
+ * Returns an array of File objects just like a normal file selection would.
+ */
+async function extractFromZip(zipFile) {
+  const zip = await JSZip.loadAsync(zipFile);
+  const extracted = [];
+
+  await Promise.all(
+    Object.values(zip.files).map(async (entry) => {
+      if (entry.dir) return;
+
+      const name = entry.name.split('/').pop(); // strip folder path
+      const lower = name.toLowerCase();
+
+      // Only keep JPGs and CSVs — silently skip PNGs and everything else
+      if (lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.csv')) {
+        const blob = await entry.async('blob');
+        const mimeType = lower.endsWith('.csv') ? 'text/csv' : 'image/jpeg';
+        extracted.push(new File([blob], name, { type: mimeType }));
+      }
+    })
+  );
+
+  return extracted;
+}
+
 function App() {
-  // state for user-uploaded files
   const [imageFiles, setImageFiles] = useState([]);
   const [csvFile, setCsvFile] = useState(null);
+  const [isUnzipping, setIsUnzipping] = useState(false);
 
   // master JSON fetched from R2 on load
   const [masterJson, setMasterJson] = useState(null);
   const [jsonLoadError, setJsonLoadError] = useState(null);
 
-  // state for user input and ui control
   const [prefix, setPrefix] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState({});
@@ -38,22 +65,37 @@ function App() {
       });
   }, []);
 
-  // handler to sort files from the consolidated uploader
-  const handleFileSelection = (selectedFiles) => {
-    const csv = selectedFiles.find(file => file.name.toLowerCase().endsWith('.csv'));
-    const images = selectedFiles.filter(file =>
-      file.name.toLowerCase().endsWith('.jpg') || file.name.toLowerCase().endsWith('.jpeg')
+  // handler to sort files — handles both direct selection and ZIP extraction
+  const handleFileSelection = async (selectedFiles) => {
+    const zipFile = selectedFiles.find(f => f.name.toLowerCase().endsWith('.zip'));
+
+    let filesToProcess = selectedFiles;
+
+    if (zipFile) {
+      setIsUnzipping(true);
+      try {
+        filesToProcess = await extractFromZip(zipFile);
+      } catch (err) {
+        alert(`Could not read ZIP file: ${err.message}`);
+        setIsUnzipping(false);
+        return;
+      }
+      setIsUnzipping(false);
+    }
+
+    const csv = filesToProcess.find(f => f.name.toLowerCase().endsWith('.csv'));
+    const images = filesToProcess.filter(f =>
+      f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.jpeg')
     );
+
     if (csv) setCsvFile(csv);
     if (images.length > 0) setImageFiles(images);
   };
 
-  // callback to update per-file upload status for the progress display
   const handleUploadProgress = (fileName, status) => {
     setUploadStatus(prev => ({ ...prev, [fileName]: status }));
   };
 
-  // main handler for processing all the files
   const handleProcessFiles = async () => {
     if (!imageFiles.length || !csvFile || !prefix) {
       alert('Please upload images and CSV, and provide a prefix.');
@@ -70,9 +112,6 @@ function App() {
 
     try {
       const processingPrefix = prefix.endsWith('_') ? prefix : `${prefix}_`;
-
-      // The folder name is the prefix without the trailing underscore
-      // e.g. "PROJECT_20250819_" -> "PROJECT_20250819"
       const folder = processingPrefix.replace(/_$/, '');
 
       // step 1: rename image files based on the prefix
@@ -87,15 +126,13 @@ function App() {
       // step 3: convert CSV to JSON, embedding the R2 URLs
       const newJsonData = await convertCsvToJson(csvFile, processingPrefix, urlMap);
 
-      // step 4: merge into the master JSON (new data overwrites matching keys)
+      // step 4: merge into the master JSON
       const finalJson = mergeJsonData(masterJson, newJsonData);
 
-      // step 5: overwrite pano_data.json on R2 with the merged result
+      // step 5: overwrite pano_data.json on R2
       const jsonPublicUrl = await uploadJsonToR2(finalJson);
 
-      // update local masterJson state so subsequent runs in the same session are correct
       setMasterJson(finalJson);
-
       setResults({ jsonPublicUrl });
       setIsResultsModalOpen(true);
 
@@ -107,7 +144,6 @@ function App() {
     }
   };
 
-  // count how many files have finished uploading
   const uploadedCount = Object.values(uploadStatus).filter(s => s === 'done').length;
   const totalCount = imageFiles.length;
 
@@ -141,12 +177,13 @@ function App() {
         <h1 className="text-3xl font-bold">Pano Sync Processor</h1>
 
         {/* R2 JSON status indicator */}
-        <div className="w-full px-4 py-2 rounded-md border text-sm
-          {jsonLoadError
+        <div className={`w-full px-4 py-2 rounded-md border text-sm ${
+          jsonLoadError
             ? 'bg-red-50 border-red-200 text-red-600'
             : masterJson === null
             ? 'bg-yellow-50 border-yellow-200 text-yellow-600'
-            : 'bg-green-50 border-green-200 text-green-700'}">
+            : 'bg-green-50 border-green-200 text-green-700'
+        }`}>
           {jsonLoadError
             ? `⚠ Could not load master JSON from R2: ${jsonLoadError}`
             : masterJson === null
@@ -157,20 +194,24 @@ function App() {
         <div className="w-full p-4 border rounded-lg bg-gray-50">
           <h2 className="text-xl font-light text-[#2D2D31] mb-2">1. Upload Files</h2>
           <FileUploader
-            title="JPG Images & CSV File"
+            title="JPG Images & CSV File (or ZIP folder)"
             onFilesSelected={handleFileSelection}
             accept=".jpg,.jpeg,.csv"
             multiple
           />
           <div className="mt-2 space-y-1">
-            {csvFile && <p className="text-sm text-pink-600">CSV file loaded: {csvFile.name}</p>}
-            {imageFiles.length > 0 && <p className="text-sm text-pink-600">{imageFiles.length} image(s) loaded.</p>}
+            {isUnzipping && (
+              <p className="text-sm text-yellow-600">⏳ Extracting ZIP...</p>
+            )}
+            {csvFile && <p className="text-sm text-pink-600">✓ CSV loaded: {csvFile.name}</p>}
+            {imageFiles.length > 0 && (
+              <p className="text-sm text-pink-600">✓ {imageFiles.length} image(s) loaded.</p>
+            )}
           </div>
         </div>
 
         <PrefixInput value={prefix} onChange={setPrefix} />
 
-        {/* upload progress display — only shown during processing */}
         {isLoading && totalCount > 0 && (
           <div className="w-full p-4 border rounded-lg bg-gray-50">
             <h2 className="text-xl font-light text-[#2D2D31] mb-2">
