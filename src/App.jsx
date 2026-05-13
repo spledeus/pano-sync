@@ -9,14 +9,25 @@ import {
   renameImageFiles,
   convertCsvToJson,
   mergeJsonData,
+  buildIndexEntry,
+  mergeIndexEntry,
 } from './lib/fileUtils';
-import { uploadFilesToR2, uploadJsonToR2, fetchJsonFromR2 } from './lib/r2Upload';
+import {
+  uploadFilesToR2,
+  uploadJsonToR2,
+  uploadProjectJsonToR2,
+  uploadIndexToR2,
+  fetchJsonFromR2,
+  fetchIndexFromR2,
+  getPublicUrl,
+} from './lib/r2Upload';
 
 // Pipeline stages shown in the progress modal
 const STAGES = {
   EXTRACTING: 'extracting',
   UPLOADING:  'uploading',
   JSON:       'json',
+  INDEX:      'index',
   DONE:       'done',
   CANCELLED:  'cancelled',
   ERROR:      'error',
@@ -31,7 +42,17 @@ function App() {
   const [masterJson, setMasterJson]       = useState(null);
   const [jsonLoadError, setJsonLoadError] = useState(null);
 
+  // master index fetched from R2 on load
+  const [masterIndex, setMasterIndex]         = useState(null);
+  const [indexLoadError, setIndexLoadError]   = useState(null);
+
   const [prefix, setPrefix] = useState('');
+
+  // project metadata
+  const [projectName, setProjectName]           = useState('');
+  const [projectTown, setProjectTown]           = useState('');
+  const [projectOwner, setProjectOwner]         = useState('ESE LLC');
+  const [projectDescription, setProjectDescription] = useState('');
 
   // progress modal state
   const [modalOpen, setModalOpen]   = useState(false);
@@ -44,7 +65,7 @@ function App() {
   // cancel signal
   const cancelledRef = useRef(false);
 
-  // fetch master JSON from R2 on load
+  // fetch master JSON and index from R2 on load
   useEffect(() => {
     fetchJsonFromR2()
       .then(data => setMasterJson(data))
@@ -52,15 +73,21 @@ function App() {
         console.error('Could not load pano_data.json from R2:', err);
         setJsonLoadError(err.message);
       });
+
+    fetchIndexFromR2()
+      .then(data => setMasterIndex(data))
+      .catch(err => {
+        console.error('Could not load pano_index.json from R2:', err);
+        setIndexLoadError(err.message);
+      });
   }, []);
 
-  // when files are dropped/selected, just store them — no processing yet
+  // when files are dropped/selected, just store them
   const handleFileSelection = (selectedFiles) => {
     setRawFiles(selectedFiles);
     setHasZip(selectedFiles.some(f => f.name.toLowerCase().endsWith('.zip')));
   };
 
-  // derive display counts from rawFiles for the non-zip case
   const directCsv    = rawFiles.find(f => f.name.toLowerCase().endsWith('.csv'));
   const directImages = rawFiles.filter(f =>
     f.name.toLowerCase().endsWith('.jpg') || f.name.toLowerCase().endsWith('.jpeg')
@@ -91,8 +118,11 @@ function App() {
       alert('Still loading master JSON from R2 — please wait a moment and try again.');
       return;
     }
+    if (masterIndex === null) {
+      alert('Still loading project index from R2 — please wait a moment and try again.');
+      return;
+    }
 
-    // reset and open the progress modal immediately
     cancelledRef.current = false;
     setExtractProgress({ done: 0, total: 0 });
     setUploadProgress({ done: 0, total: 0 });
@@ -172,17 +202,39 @@ function App() {
 
       if (cancelledRef.current) return;
 
-      // ── Step 4: convert CSV → JSON and merge ──────────────────────────
+      // ── Step 4: convert CSV → project JSON ────────────────────────────
       setStage(STAGES.JSON);
 
-      const newJsonData = await convertCsvToJson(csvFile, processingPrefix, urlMap);
-      const finalJson   = mergeJsonData(masterJson, newJsonData);
-      const url         = await uploadJsonToR2(finalJson);
+      const { projectJson, wgs84Points } = await convertCsvToJson(csvFile, processingPrefix, urlMap);
+
+      // Upload per-project JSON to FOLDER/pano_data.json
+      await uploadProjectJsonToR2(folder, projectJson);
+
+      // Also merge into legacy root pano_data.json during migration period
+      const finalMasterJson = mergeJsonData(masterJson, projectJson);
+      const legacyUrl = await uploadJsonToR2(finalMasterJson);
 
       if (cancelledRef.current) return;
 
-      setMasterJson(finalJson);
-      setJsonPublicUrl(url);
+      // ── Step 5: rebuild master index ──────────────────────────────────
+      setStage(STAGES.INDEX);
+
+      const metadata = {
+        name:        projectName  || folder,
+        town:        projectTown,
+        owner:       projectOwner || 'ESE LLC',
+        description: projectDescription,
+      };
+
+      const newEntry   = buildIndexEntry(folder, projectJson, wgs84Points, metadata, getPublicUrl());
+      const finalIndex = mergeIndexEntry(masterIndex, newEntry);
+      const indexUrl   = await uploadIndexToR2(finalIndex);
+
+      if (cancelledRef.current) return;
+
+      setMasterJson(finalMasterJson);
+      setMasterIndex(finalIndex);
+      setJsonPublicUrl(indexUrl);
       setStage(STAGES.DONE);
 
     } catch (err) {
@@ -204,7 +256,6 @@ function App() {
     return (
       <div className="flex flex-col gap-4 min-w-[320px]">
 
-        {/* Extraction row */}
         <ProgressRow
           label="Extracting ZIP"
           active={stage === STAGES.EXTRACTING}
@@ -212,23 +263,23 @@ function App() {
           skipped={!hasZip}
           progress={extractProgress}
         />
-
-        {/* Upload row */}
         <ProgressRow
           label="Uploading images to R2"
           active={stage === STAGES.UPLOADING}
-          done={[STAGES.JSON, STAGES.DONE].includes(stage)}
+          done={[STAGES.JSON, STAGES.INDEX, STAGES.DONE].includes(stage)}
           progress={uploadProgress}
         />
-
-        {/* JSON row */}
         <ProgressRow
-          label="Updating JSON"
+          label="Writing project JSON"
           active={stage === STAGES.JSON}
+          done={[STAGES.INDEX, STAGES.DONE].includes(stage)}
+        />
+        <ProgressRow
+          label="Updating project index"
+          active={stage === STAGES.INDEX}
           done={stage === STAGES.DONE}
         />
 
-        {/* Result / error */}
         {isDone && (
           <div className="rounded-md bg-green-50 border border-green-200 p-3">
             <p className="text-sm font-semibold text-green-700 mb-1">✓ All done!</p>
@@ -255,7 +306,6 @@ function App() {
           </p>
         )}
 
-        {/* Buttons */}
         <div className="flex gap-2 justify-end mt-2">
           {isActive && (
             <button
@@ -293,7 +343,7 @@ function App() {
       <main className="flex flex-col items-center p-5 space-y-4 max-w-2xl mx-auto">
         <h1 className="text-3xl font-bold">Pano Sync Processor</h1>
 
-        {/* R2 JSON status indicator */}
+        {/* R2 status indicators */}
         <div className={`w-full px-4 py-2 rounded-md border text-sm ${
           jsonLoadError
             ? 'bg-red-50 border-red-200 text-red-600'
@@ -308,6 +358,21 @@ function App() {
             : `✓ Master JSON loaded — ${Object.keys(masterJson).length.toLocaleString()} entries`}
         </div>
 
+        <div className={`w-full px-4 py-2 rounded-md border text-sm ${
+          indexLoadError
+            ? 'bg-red-50 border-red-200 text-red-600'
+            : masterIndex === null
+            ? 'bg-yellow-50 border-yellow-200 text-yellow-600'
+            : 'bg-green-50 border-green-200 text-green-700'
+        }`}>
+          {indexLoadError
+            ? `⚠ Could not load project index from R2: ${indexLoadError}`
+            : masterIndex === null
+            ? '⏳ Loading project index from R2...'
+            : `✓ Project index loaded — ${masterIndex.length} project${masterIndex.length !== 1 ? 's' : ''}`}
+        </div>
+
+        {/* Step 1: Files */}
         <div className="w-full p-4 border rounded-lg bg-gray-50">
           <h2 className="text-xl font-light text-[#2D2D31] mb-2">1. Upload Files</h2>
           <FileUploader
@@ -331,7 +396,68 @@ function App() {
           </div>
         </div>
 
+        {/* Step 2: Prefix */}
         <PrefixInput value={prefix} onChange={setPrefix} />
+
+        {/* Step 3: Project Metadata */}
+        <div className="w-full p-4 border rounded-lg bg-gray-50">
+          <h2 className="text-xl font-light text-[#2D2D31] mb-3">3. Project Details</h2>
+          <div className="space-y-3">
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Project Name <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="text"
+                value={projectName}
+                onChange={e => setProjectName(e.target.value)}
+                placeholder="e.g. Ridgevale Golf Course"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-pink-300"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Town
+              </label>
+              <input
+                type="text"
+                value={projectTown}
+                onChange={e => setProjectTown(e.target.value)}
+                placeholder="e.g. Chatham"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-pink-300"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Owner
+              </label>
+              <input
+                type="text"
+                value={projectOwner}
+                onChange={e => setProjectOwner(e.target.value)}
+                placeholder="e.g. ESE LLC"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-pink-300"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Description <span className="text-gray-400 font-normal">(optional)</span>
+              </label>
+              <input
+                type="text"
+                value={projectDescription}
+                onChange={e => setProjectDescription(e.target.value)}
+                placeholder="e.g. Survey of fairways and cart paths"
+                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-pink-300"
+              />
+            </div>
+
+          </div>
+        </div>
 
         <ActionPanel onProcess={handleProcessFiles} isLoading={false} />
       </main>
