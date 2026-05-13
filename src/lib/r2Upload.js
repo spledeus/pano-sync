@@ -104,10 +104,14 @@ const uploadToR2 = async (objectKey, body, contentType) => {
   }
 };
 
+// ── Public R2 URL helper ──────────────────────────────────────────────────────
+export const getPublicUrl = () => PUBLIC_URL;
+
+// ── Fetch functions ───────────────────────────────────────────────────────────
+
 /**
- * Fetches the current pano_data.json directly from R2's public URL.
+ * Fetches the current pano_data.json (legacy master) from R2's public URL.
  * Returns an empty object if the file doesn't exist yet.
- * @returns {Promise<object>} - The parsed JSON object.
  */
 export const fetchJsonFromR2 = async () => {
   const url = `${PUBLIC_URL}/pano_data.json?nocache=${Date.now()}`;
@@ -123,12 +127,26 @@ export const fetchJsonFromR2 = async () => {
 };
 
 /**
+ * Fetches the master project index (pano_index.json) from R2.
+ * Returns an empty array if the file doesn't exist yet.
+ */
+export const fetchIndexFromR2 = async () => {
+  const url = `${PUBLIC_URL}/pano_index.json?nocache=${Date.now()}`;
+  const response = await fetch(url);
+  if (response.status === 404) {
+    console.warn('pano_index.json not found in R2 — starting fresh.');
+    return [];
+  }
+  if (!response.ok) {
+    throw new Error(`Failed to fetch pano_index.json: ${response.status}`);
+  }
+  return response.json();
+};
+
+// ── Upload functions ──────────────────────────────────────────────────────────
+
+/**
  * Uploads a single image file to R2 inside a folder named after the prefix.
- * Example: prefix=PROJECT_20250819_ -> folder=PROJECT_20250819
- * @param {File} file - The renamed image file.
- * @param {string} folder - The folder name (prefix without trailing underscore).
- * @param {function} onProgress - Callback with (fileName, status).
- * @returns {Promise<string>} - The full public URL of the uploaded file.
  */
 export const uploadFileToR2 = async (file, folder, onProgress) => {
   const objectKey = `${folder}/${file.name}`;
@@ -140,10 +158,6 @@ export const uploadFileToR2 = async (file, folder, onProgress) => {
 
 /**
  * Uploads an array of image files to R2 in parallel.
- * @param {File[]} files - Array of renamed image files.
- * @param {string} folder - The folder name to upload into.
- * @param {function} onProgress - Callback with (fileName, status).
- * @returns {Promise<Map<string, string>>} - Map of filename -> public URL.
  */
 export const uploadFilesToR2 = async (files, folder, onProgress) => {
   const urlMap = new Map();
@@ -157,10 +171,34 @@ export const uploadFilesToR2 = async (files, folder, onProgress) => {
 };
 
 /**
- * Uploads the final merged JSON to R2 at the root of the bucket.
- * Always overwrites pano_data.json so the GIS map URL never changes.
- * @param {object} jsonData - The final merged JSON object.
- * @returns {Promise<string>} - The public URL of the JSON file.
+ * Uploads a per-project pano_data.json to FOLDER/pano_data.json in R2.
+ * @param {string} folder - e.g. "RIDGEVALE_20250626"
+ * @param {object} projectJson - the project's image entries
+ * @returns {Promise<string>} - public URL of the uploaded file
+ */
+export const uploadProjectJsonToR2 = async (folder, projectJson) => {
+  const objectKey = `${folder}/pano_data.json`;
+  const body = JSON.stringify(projectJson, null, 2);
+  await uploadToR2(objectKey, body, 'application/json');
+  return `${PUBLIC_URL}/${objectKey}`;
+};
+
+/**
+ * Uploads the master project index to pano_index.json at bucket root.
+ * @param {object[]} indexData - array of project index entries
+ * @returns {Promise<string>} - public URL of the uploaded file
+ */
+export const uploadIndexToR2 = async (indexData) => {
+  const objectKey = 'pano_index.json';
+  const body = JSON.stringify(indexData, null, 2);
+  await uploadToR2(objectKey, body, 'application/json');
+  return `${PUBLIC_URL}/${objectKey}`;
+};
+
+/**
+ * Uploads the legacy merged pano_data.json to root (kept during migration).
+ * @param {object} jsonData - the full merged JSON object
+ * @returns {Promise<string>} - public URL
  */
 export const uploadJsonToR2 = async (jsonData) => {
   const objectKey = 'pano_data.json';
